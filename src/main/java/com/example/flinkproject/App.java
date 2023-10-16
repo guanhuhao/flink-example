@@ -16,7 +16,7 @@ import org.apache.flink.api.common.functions.Partitioner;
 import org.apache.flink.api.common.typeinfo.Types;
 import org.apache.flink.core.fs.FileSystem.WriteMode;
 import org.apache.flink.util.Collector;
-
+import org.apache.flink.api.java.utils.ParameterTool;
 
 
 // import org.apache.flink.graph.library.PageRank;
@@ -33,90 +33,110 @@ import java.util.logging.Logger;
 public class App {
     private static final Logger logger = Logger.getLogger(App.class.getName());
     public static void main(String[] args) throws Exception {
+        ParameterTool params = ParameterTool.fromArgs(args);
+        String partNum = params.get("p", "2");
+        String vertFile = params.get("v", "/home/flink-example/data/entropy-vertex.txt");
+        String edgeFile = params.get("e", "/home/flink-example/data/entropy-edge.txt");
+        String resultFile = params.get("r", "/home/flink-example/data/result");
+
         ExecutionEnvironment env = ExecutionEnvironment.getExecutionEnvironment();
+        env.getConfig().enableObjectReuse();
         // StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
-        DataSet<Tuple2<Long, Double>> vertexTuples = env.readCsvFile("/home/flink-example/data/random-vertex.txt").
+        DataSet<Tuple2<Long, Double>> vertexTuples = env.readCsvFile(vertFile).
             types(Long.class, Double.class);
-        DataSet<Tuple3<Long, Long, Double>> edgeTuples = env.readCsvFile("/home/flink-example/data/random-edge.txt").
+        DataSet<Tuple3<Long, Long, Double>> edgeTuples = env.readCsvFile(edgeFile).
             types(Long.class, Long.class, Double.class);
-        
-        DataSet<Tuple2<Long, Double>> partitionedVertex = vertexTuples.partitionCustom(new CustomPartitioner(), 0).setParallelism(2);
-        DataSet<Tuple3<Long, Long, Double>> partitionedEdge = edgeTuples.partitionCustom(new CustomPartitioner(), 0).setParallelism(2);
-        partitionedVertex.writeAsText("/home/flink-example/data/result.txt",WriteMode.OVERWRITE);
+        env.setParallelism(Integer.parseInt(partNum));
+        DataSet<Tuple2<Long, Double>> partitionedVertex = vertexTuples.partitionCustom(new CustomPartitioner(), 0);
+        // setParallelism(2);
+        DataSet<Tuple3<Long, Long, Double>> partitionedEdge = edgeTuples.partitionCustom(new CustomPartitioner(), 0);//.setParallelism(2);
+        // partitionedVertex.writeAsText(resultFile ,WriteMode.OVERWRITE);
 
+        DataSet<Tuple3<Long, Long, Double>> Edge =  partitionedEdge.partitionCustom(new CustomPartitioner(), 0);
 
-        DataSet<Tuple2<Long, Double>> InitpartitionedVertex = partitionedVertex.map(new MapFunction<Tuple2<Long,Double>,Tuple2<Long,Double> >() {
-            @Override
-            public Tuple2<Long, Double> map(Tuple2<Long,Double> vertix) throws Exception {
-                return Tuple2.of(vertix.f0,Double.POSITIVE_INFINITY);
-            }
-        });
-        Long src = 4L;
-        DataSet<Tuple2<Long,Double>> message = env.fromElements(new Tuple2<Long,Double>(src,0d));
-        message = env.fromElements(new Tuple2<Long,Double>(src,1d));
+        DataSet<Tuple2<Long, Double>> Vert =  partitionedVertex.map(
+            new MapFunction<Tuple2<Long,Double>,Tuple2<Long,Double> >() {
+                @Override
+                public Tuple2<Long, Double> map(Tuple2<Long,Double> vertix) throws Exception {
+                    return Tuple2.of(vertix.f0,Double.POSITIVE_INFINITY);
+                }
+            });
+        // DataSet<Tuple2<Long, Double>> InitpartitionedVertex = partitionedVertex.map(new MapFunction<Tuple2<Long,Double>,Tuple2<Long,Double> >() {
+        //     @Override
+        //     public Tuple2<Long, Double> map(Tuple2<Long,Double> vertix) throws Exception {
+        //         return Tuple2.of(vertix.f0,Double.POSITIVE_INFINITY);
+        //     }
+        // });
+        Long src = Vert.min(0).getInput().first(1).collect().get(0).f0;
+        DataSet<Tuple2<Long,Double>> message1 = env.fromElements(new Tuple2<Long,Double>(src,0d));
+        message1 = env.fromElements(new Tuple2<Long,Double>(src,1d));
+        DataSet<Tuple2<Long,Double>> hyperEdge = Vert.filter(vertex -> vertex.f0 % 2 == 1);
+        DataSet<Tuple2<Long,Double>> hyperVert = Vert.filter(vertex -> vertex.f0 % 2 == 0);
         Long step = 0L;
-        while(message.count() != 0){
+        while(message1.count() != 0){
             step = step + 1;
-            message.writeAsText("/home/flink-example/data/result.txt/step"+Long.toString(step), WriteMode.OVERWRITE);
-            System.out.println("step " + Long.toString(step) +" count:" + Long.toString(message.count()));
-            DataSet<Tuple2<Long,Double>> change = message.groupBy(0).min(1)
-                .join(InitpartitionedVertex).where(0).equalTo(0).with((a,b) -> 
-                    new Tuple3<Long,Double,Double>(a.f0, a.f1, b.f1)
-                ).returns(Types.TUPLE(Types.LONG, Types.DOUBLE,Types.DOUBLE)).filter(a -> a.f1 < a.f2).map(a -> new Tuple2<Long,Double>(a.f0, a.f1)).returns(Types.TUPLE(Types.LONG, Types.DOUBLE));
+            if (step == 2) break;
+            // Vert.writeAsText("/home/flink-example/data/result.txt/step"+Long.toString(step), WriteMode.OVERWRITE);
+            System.out.println("step " + Long.toString(step));
 
-            InitpartitionedVertex = InitpartitionedVertex.union(change).groupBy(0).min(1);
+            // state 1
+            DataSet<Tuple2<Long,Double>> aggMessage1 = message1.groupBy(0).min(1).partitionCustom(new CustomPartitioner(), 0);
+            DataSet<Tuple2<Long,Double>> updatedVert = aggMessage1.join(Vert)
+                .where(0).equalTo(0).with(
+                    (message,vertex) -> new Tuple3<Long,Double,Double>(message.f0, message.f1, vertex.f1)
+                ).returns(Types.TUPLE(Types.LONG, Types.DOUBLE,Types.DOUBLE))
+                .filter(a -> a.f1 < a.f2).map(a -> new Tuple2<Long,Double>(a.f0, a.f1))
+                .returns(Types.TUPLE(Types.LONG, Types.DOUBLE))
+                .partitionCustom(new CustomPartitioner(), 0);
 
-            // change.writeAsText("/home/flink-example/data/result.txt/change.txt",WriteMode.OVERWRITE);
+            Vert = Vert.union(updatedVert).groupBy(0).min(1);
+            DataSet<Tuple2<Long,Double>> message2 = Edge.join(updatedVert)
+                .where(0).equalTo(0).with(
+                    (edge,vertex) -> new Tuple2<Long,Double>(edge.f1, vertex.f1) 
+                ).returns(Types.TUPLE(Types.LONG, Types.DOUBLE))
+                .partitionCustom(new CustomPartitioner(), 0);
 
-            // DataSet<Tuple2<Long, Double>> Testmessage = change.flatMap(
-            //     new FlatMapFunction<Tuple2<Long,Double>, Tuple2<Long,Double>>()  {
-            //         @Override
-            //         public void flatMap(Tuple2<Long,Double> vertex, Collector<Tuple2<Long,Double>> out) {
-            //             try {
-            //                 partitionedEdge
-            //                     .filter(edge -> edge.f0 == vertex.f0).collect()
-            //                     .forEach(edge -> 
-            //                         out.collect(new Tuple2<Long, Double>(edge.f1, vertex.f1 + 1)) 
-            //                     );
-            //             } catch (Exception e) {
-            //                 System.out.println("Exception get in App.java line 78");
-            //             }
-            //         }
-            //     });
+            System.out.println(
+                "message1 count:" + Long.toString(message1.count()) +
+                "   Agg message1 count:" + Long.toString(aggMessage1.count()) + 
+                "   updated Vert:" + Long.toString(updatedVert.count())
+                );
 
-            message = change.join(partitionedEdge).where(0).equalTo(0).with((a,b) -> new Tuple2<Long,Double>(b.f1, a.f1 + 1.0d)).returns(Types.TUPLE(Types.LONG, Types.DOUBLE));
-            System.out.println("next step " + Long.toString(step) + " change count:" +  Long.toString(change.count()) +" message count:" + Long.toString(message.count()));
+            // state 2 
+            System.out.println("message2 count:" + Long.toString(message2.count()));
+            DataSet<Tuple2<Long,Double>> aggMessage2 = message2.groupBy(0).min(1)
+                .partitionCustom(new CustomPartitioner(), 0);
+            DataSet<Tuple2<Long,Double>> message3 = Edge.join(aggMessage2).where(0).equalTo(0).with(
+                (edge, message) -> new Tuple2<Long,Double>(edge.f1, message.f1)
+                ).returns(Types.TUPLE(Types.LONG, Types.DOUBLE))
+                .partitionCustom(new CustomPartitioner(), 0);
+            DataSet<Tuple2<Long,Double>> aggMessage3 = message3.groupBy(0).min(1)
+                .partitionCustom(new CustomPartitioner(), 0);
+            DataSet<Tuple2<Long,Double>> updatedEdge = aggMessage3.join(hyperEdge)
+                .where(0).equalTo(0).with(
+                    (message, edge) -> new Tuple3<Long,Double,Double>(message.f0, message.f1, edge.f1)
+                ).returns(Types.TUPLE(Types.LONG, Types.DOUBLE))
+                .filter(a -> a.f1 < a.f2).map(a -> new Tuple2<Long,Double>(a.f0, a.f1))
+                .returns(Types.TUPLE(Types.LONG, Types.DOUBLE))
+                .partitionCustom(new CustomPartitioner(), 0);
+
+            System.out.println(
+                "message2 count:" + Long.toString(message2.count()) +
+                "   Agg message1 count:" + Long.toString(aggMessage2.count()) + 
+                "   updated Edge:" + Long.toString(updatedEdge.count())
+                );
+
+            // state3 
+            System.out.println("message3 count:" + Long.toString(message3.count()));
+            message1 = Edge.join(updatedEdge).where(0).equalTo(0).with(
+                    (edge, vert) -> new Tuple2<Long,Double>(edge.f1, vert.f1 + 1.0d)
+                )
+                .returns(Types.TUPLE(Types.LONG, Types.DOUBLE))
+                .partitionCustom(new CustomPartitioner(), 0);
             
-            // .flatMap(
-            //     new FlatMapFunction<Tuple2<Long,Double>, Tuple2<Long,Double>>()  {
-            //         @Override
-            //         public void flatMap(Tuple2<Long,Double> vertex, Collector<Tuple2<Long,Double>> out) {
-            //             try {
-            //                 partitionedEdge
-            //                     .filter(edge -> edge.f0 == vertex.f0).collect()
-            //                     .forEach(edge -> 
-            //                         out.collect(new Tuple2<Long, Double>(edge.f1, vertex.f1 + 1)) 
-            //                     );
-            //             } catch (Exception e) {
-            //                 System.out.println("Exception get in App.java line 78");
-            //             }
-            //         }
-            //     });
-            // Testmessage.writeAsText("/home/flink-example/data/result.txt/Test",WriteMode.OVERWRITE);
-            // break;
-
-            // message = change.flatMap((Tuple2<Long, Double> vertex, Collector<Tuple2<Long, Double>> out) -> {
-            //     partitionedEdge
-            //         .filter(edge -> edge.f0 == vertex.f0)
-            //         .forEach(edge -> {
-            //             out.collect(new Tuple2<>(edge.f1, vertex.f1 + 1));
-            //         });
-            // });
-            // break;
-            // if(step == 5) break;
         }
-        InitpartitionedVertex.writeAsText("/home/flink-example/data/result.txt/Init",WriteMode.OVERWRITE);
+        Vert.writeAsText(resultFile+"/Init",WriteMode.OVERWRITE);
         // DataStream<Integer> mergedStream = initialStream;
 
         // for (int i = 0; i < 3; i++) {
@@ -180,7 +200,7 @@ public class App {
     public static class CustomPartitioner implements Partitioner<Long> {
         @Override
         public int partition(Long key, int numPartitions) {
-            int partId = key.intValue() % 2;
+            int partId = (key.intValue() / 2)% numPartitions;
             return partId;
             // return 0;
         }
